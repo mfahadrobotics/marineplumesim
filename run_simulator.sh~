@@ -1,0 +1,7 @@
+#!/bin/bash 
+
+cd $PLUMESIM &&
+python viz_update.py
+cd $PLUMESIM &&
+gnome-terminal -x bash -c "roslaunch plume_simulator_viz.launch; exec $SHELL"
+

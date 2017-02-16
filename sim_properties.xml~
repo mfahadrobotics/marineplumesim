@@ -1,0 +1,31 @@
+<data>
+    <parameters>
+
+        <lx val="60.0"></lx>
+        <ly val="20.0"></ly>
+
+        <src x="1.0" y="5.0" con="1300.0" mean_time_high="2.0" std_time_high="1.0" mean_time_low="20.0" std_time_low="1.0"></src>
+
+        <vis_conc val="100"></vis_conc>
+
+        <cr_num val="0.1"></cr_num>
+
+        <grid_x val="0.1"></grid_x>
+        <grid_y val="0.1"></grid_y>
+
+        <flow_x val="0.1" chg_dir = "N"></flow_x>
+        <flow_y val="0.02" chg_dir = "Y"></flow_y>
+
+
+        <flow_up_rt val="30"></flow_up_rt>
+	<flow_sol_t val="700"></flow_sol_t>
+	<flow_p_nit val="50"></flow_p_nit>
+
+
+        <sim_duration val="150"></sim_duration>
+
+        <k1_x val="0.0000001"></k1_x>
+        <k1_y val="0.0000001"></k1_y>
+
+    </parameters>
+</data>

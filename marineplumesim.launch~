@@ -1,0 +1,4 @@
+<launch>
+
+	<node name="rviz" pkg="rviz" type="rviz" args="-d $(find marineplumesim)/rviz/plume_simulator.rviz" required="true" />
+</launch>

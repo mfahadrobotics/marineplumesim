@@ -1,0 +1,526 @@
+#!/usr/bin/env python
+"""
+@author: mfahad
+@Purpose: This class holds the main solver fucntions and also publishes the plume concentration using flow field.
+"""
+from xml.dom import minidom
+import rospy
+from math import ceil
+import math
+from math import sqrt
+from math import atan2
+import sys
+import numpy as np
+from sensor_msgs.msg import PointCloud
+import std_msgs.msg
+from geometry_msgs.msg import Point
+from sensor_msgs.msg import ChannelFloat32 as Channel
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+from visualization_msgs.msg import Marker
+from visualization_msgs.msg import MarkerArray
+import rospy
+from tf.transformations import quaternion_from_euler
+import time
+from rospy_tutorials.msg import Floats
+from rospy.numpy_msg import numpy_msg
+from std_msgs.msg import Float64
+
+class plume():
+    
+
+    def __init__(self):
+        
+        self.xmldoc = minidom.parse('sim_properties.xml')
+        self.read_xml()
+        self.nx = int(ceil(self.x/self.grid_x))
+        self.ny = int(ceil(self.y/self.grid_y))
+        self.tot_threads = self.nx*self.ny
+        self.init_variables()
+        
+        self.fet_parameters() 
+        
+        self.dev_compute_capability = cuda.Device(0).compute_capability()[0] 
+        
+        self.best_device_select()
+
+        
+
+        self.ros_pub_setup()
+        itemlist = self.xmldoc.getElementsByTagName('src') 
+        self.src_setup(itemlist) #Setup multiple sources        
+        self.u_last = np.copy(self.u)
+   
+        self.ptcloud = PointCloud()
+
+        self.ptcloud = self.pt_cloud_setup(self.nx,self.ny,self.grid_x,self.grid_y)
+        self.pcl_pub.publish(self.ptcloud)
+        
+        
+        self.thread_block_grid()#calculate thread, block and grid size
+        
+        self.allocate_gpu_mem() #allocate memory on gpu
+        
+        self.copy_to_gpu() # Copy desired variables to memory
+        
+        self.kernel_setup()#steup the kernels
+        
+        self.t_step2D = self.mod1.get_function("time_step_cuda2D") 
+
+        self.run_times=0 #useless variable
+        
+        self.flow_update()
+
+        
+    def read_xml(self):
+
+        itemlist = self.xmldoc.getElementsByTagName('cr_num')
+        self.cr_num=float(itemlist[0].attributes['val'].value)
+
+        itemlist = self.xmldoc.getElementsByTagName('sim_duration')
+        self.sim_duration=float(itemlist[0].attributes['val'].value)
+
+        itemlist = self.xmldoc.getElementsByTagName('flow_x')
+        self.v1_x_max=float(itemlist[0].attributes['val'].value)
+        self.v1_x_dir=str(itemlist[0].attributes['chg_dir'].value)
+        itemlist = self.xmldoc.getElementsByTagName('flow_y')
+        self.v1_y_max=float(itemlist[0].attributes['val'].value)
+        self.v1_y_dir=str(itemlist[0].attributes['chg_dir'].value)
+        itemlist = self.xmldoc.getElementsByTagName('frame_id')
+        self.frameid=str(itemlist[0].attributes['val'].value)
+        
+        itemlist = self.xmldoc.getElementsByTagName('flow_up_rt')
+        self.flow_up_rt=float(itemlist[0].attributes['val'].value)
+        
+        itemlist = self.xmldoc.getElementsByTagName('lx')
+        self.x=float(itemlist[0].attributes['val'].value)
+        itemlist = self.xmldoc.getElementsByTagName('ly')
+        self.y=float(itemlist[0].attributes['val'].value)
+
+        itemlist = self.xmldoc.getElementsByTagName('grid_x')
+        self.grid_x=float(itemlist[0].attributes['val'].value)
+        itemlist = self.xmldoc.getElementsByTagName('grid_y')
+        self.grid_y=float(itemlist[0].attributes['val'].value)
+
+        self.dt=float(0.0)
+        itemlist = self.xmldoc.getElementsByTagName('k1_x')
+        self.k1_x=float(itemlist[0].attributes['val'].value)
+        itemlist = self.xmldoc.getElementsByTagName('k1_y')
+        self.k1_y=float(itemlist[0].attributes['val'].value)
+        itemlist = self.xmldoc.getElementsByTagName('vis_conc')
+        self.max_vis_con = float(itemlist[0].attributes['val'].value)
+        
+    def copy_to_gpu(self):
+        
+        cuda.memcpy_htod(self.r_gpu,self.r)
+        cuda.memcpy_htod(self.g_gpu,self.g)
+        cuda.memcpy_htod(self.b_gpu,self.b)
+        cuda.memcpy_htod(self.u_last_gpu,self.u_last)
+        cuda.memcpy_htod(self.u_gpu,self.u)
+        cuda.memcpy_htod(self.v1_gpu,self.v1)
+        cuda.memcpy_htod(self.v1x_gpu,self.v1x)
+        cuda.memcpy_htod(self.v1y_gpu,self.v1y)
+
+            
+    def copy_from_gpu_updated(self):
+        
+        cuda.memcpy_dtoh(self.u_last,self.u_gpu)
+        cuda.memcpy_dtoh(self.v1,self.v1_gpu)        
+        cuda.memcpy_dtoh(self.u, self.u_gpu)
+        cuda.memcpy_dtoh(self.r, self.r_gpu)
+        cuda.memcpy_dtoh(self.g, self.g_gpu)
+        cuda.memcpy_dtoh(self.b, self.b_gpu)
+
+
+    def allocate_gpu_mem(self):
+        
+        self.r_gpu = cuda.mem_alloc(self.r.nbytes)
+        self.g_gpu = cuda.mem_alloc(self.g.nbytes)
+        self.b_gpu = cuda.mem_alloc(self.b.nbytes)
+        self.u_last_gpu = cuda.mem_alloc(self.u_last.nbytes)
+        self.u_gpu = cuda.mem_alloc(self.u.nbytes)        
+        self.v1_gpu = cuda.mem_alloc(self.v1.nbytes)
+        self.v1x_gpu =  cuda.mem_alloc(self.v1x.nbytes) 
+        self.v1y_gpu =  cuda.mem_alloc(self.v1y.nbytes) 
+
+        
+    def thread_block_grid(self):
+        
+        self.block_x = 16            
+        self.block_y = 16     
+        self.block_z = 4
+            
+        self.grd_x = int(math.ceil(float(self.tot_threads)/(self.block_x*self.block_y*self.block_z)))
+            
+        if self.grd_x<=1:
+            self.grid_xx = 1            
+        elif (self.grd_x>1) and (self.grd_x<self.gd_x):
+            self.grid_xx=self.grd_x
+        else:
+            self.grid_xx = self.gd_x
+
+        self.grd_y = int(math.ceil(float(self.grd_x)/float(self.grid_xx)))
+            
+        if self.grd_y<=1:
+            self.grid_yy = 1            
+        elif (self.grd_y>1) and (self.grd_y<self.gd_y):
+            self.grid_yy = self.grd_y
+        else:
+            self.grid_yy = self.gd_y
+            
+        self.grd_z = int(math.ceil(self.grd_y/self.grid_yy))
+            
+        if self.grd_z<=1:
+            self.grid_zz = 1            
+        elif (self.grd_z>1) and (self.grd_z<self.gd_z):
+            self.grid_zz = self.grd_z
+        else:
+            self.grid_zz = self.gd_z
+            
+        self.grid_xx = int(self.grid_xx)
+        self.grid_yy = int(self.grid_yy)
+        self.grid_zz = int(self.grid_zz)
+        print "Grid X: "+str(self.grid_xx)
+        print "Grid Y: "+str(self.grid_yy)
+        print "Grid Z: "+str(self.grid_zz)
+
+    def kernel_setup(self):
+               
+        self.mod1 = SourceModule("""
+
+            #include <stdio.h>
+            #include <math.h>
+            __global__ void time_step_cuda2D(float *v1x, float *v1y, float *r, float *g, float *b, float *u_last, float *u, int nx, int ny, float grid_x, float grid_y, float k1_x, float k1_y, float dt, float *v1, float max_con)
+            {
+                int blockId = blockIdx.x+ blockIdx.y * gridDim.x+ gridDim.x * gridDim.y * blockIdx.z;
+                int threadId = blockId * (blockDim.x * blockDim.y * blockDim.z)+ (threadIdx.z * (blockDim.x * blockDim.y))+ (threadIdx.y * blockDim.x)+ threadIdx.x;
+
+                int i1 = threadId/ny;
+                int i2 = threadId%ny;
+                
+                float du_dx,du_dy,d2ux,d2uy,d2u,du,f;
+                  
+                if ((i1>0) and (i1<nx-1) and (i2>0) and (i2<ny-1)) {
+                    
+                    if (v1x[threadId]<0)
+                        du_dx=(u_last[threadId+ny]-u_last[threadId])/grid_x;
+                    if (v1x[threadId]>0)
+                        du_dx=(u_last[threadId]-u_last[threadId-ny])/grid_x;
+                            
+                    d2ux=(u_last[threadId+ny]+u_last[threadId-ny]-2*u_last[threadId])/(grid_x*grid_x);
+
+                    if (v1y[threadId]<0)
+                        du_dy=(u_last[threadId+1]-u_last[threadId])/grid_y;
+                    if (v1y[threadId]>0)                            
+                        du_dy=(u_last[threadId]-u_last[threadId-1])/grid_y;
+                            
+                    d2uy=(u_last[threadId+1]+u_last[threadId-1]-2*u_last[threadId])/(grid_y*grid_y);
+                    
+                    d2u=k1_x*d2ux+k1_y*d2uy;
+                    du=-1*v1x[threadId]*du_dx-v1y[threadId]*du_dy+d2u;                    
+                    u[threadId]=u_last[threadId]+du*dt;
+                    
+                    if (u[threadId]>1){
+                        if (log(u[threadId])<log(max_con))
+                            f = log(u[threadId]);
+                        else
+                            f = log(max_con);
+                        
+                        if (f < (0.25 * log(max_con))) {
+                            r[threadId] = 0;
+                            g[threadId] = (4 * f) / log(max_con);
+                            b[threadId] = 1;
+                            } 
+                    
+                        else if (f < (0.5 * log(max_con))) {
+                            r[threadId] = 0;
+                            g[threadId] = 1;
+                            b[threadId] = 1 + 4 * ( 0.25 * log(max_con) - f) / log(max_con);
+                            } 
+                    
+                        else if (f < (0.75 * log(max_con))) {
+                            r[threadId] = 4 * (f - 0.5 * log(max_con)) / log(max_con);
+                            g[threadId] = 1;
+                            b[threadId] = 0;
+                            } 
+                    
+                        else {
+                            r[threadId] = 1;
+                            g[threadId] = 1 + 4 * ( 0.75 * log(max_con) - f) / log(max_con);
+                            b[threadId] = 0;
+                            }                        
+                    }
+
+                    else{
+                        r[threadId]=0.0;
+                        g[threadId]=0.0;
+                        b[threadId]=0.0;
+                    
+                    }
+
+                }
+                
+            }              
+            
+        """)     
+
+    def flow_update(self):
+        
+        u_fname = 'data/u'+str(self.fl_counter+1)+'_save.npy'
+        v_fname = 'data/v'+str(self.fl_counter+1)+'_save.npy'
+        temp_u = np.load(u_fname)
+        temp_v = np.load(v_fname)
+ 
+        for i1 in range(0,self.nx):
+            for i2 in range(0,self.ny):
+                self.v1x[(i1*self.ny)+i2] =  temp_u[i2,i1]      
+                self.v1y[(i1*self.ny)+i2] =  temp_v[i2,i1]
+ 
+         
+        self.fl_counter = self.fl_counter+1        
+        self.up_dt()
+        self.flow_marker_array_publish()
+
+    def up_dt(self):
+
+        a=np.amax(self.v1x)*(abs(np.amax(self.v1x))>abs(np.amin(self.v1x)))+np.amin(self.v1x)*(abs(np.amin(self.v1x))>abs(np.amax(self.v1x)))
+        b=np.amax(self.v1y)*(abs(np.amax(self.v1y))>abs(np.amin(self.v1y)))+np.amin(self.v1y)*(abs(np.amin(self.v1y))>abs(np.amax(self.v1y)))
+        self.dt = self.cr_num/(abs(a/self.grid_x)+abs(b/self.grid_y))
+        
+    def init_variables(self): #Initialize the variables
+
+        self.fl_counter = -1 
+        self.device_best = 0
+        self.r =  np.zeros((self.tot_threads), np.float32)
+        self.g =  np.zeros((self.tot_threads), np.float32)
+        self.b =  np.zeros((self.tot_threads), np.float32)
+        self.u_last =  np.zeros((self.tot_threads), np.float32)
+        self.u =  np.zeros((self.tot_threads), np.float32)
+        self.v1 =  np.zeros((3), np.float32)
+        self.v1x =  np.zeros((self.tot_threads), np.float32)
+        self.v1y =  np.zeros((self.tot_threads), np.float32)
+        self.t = 0.0
+            
+    def fet_parameters(self): #Fetch the parameters of the installed GPU
+        
+        self.mem_size = float(cuda.Device(self.device_best).total_memory())
+        self.gd_x = float(cuda.Device(self.device_best).get_attribute(cuda.device_attribute.MAX_GRID_DIM_X))
+        self.gd_y = float(cuda.Device(self.device_best).get_attribute(cuda.device_attribute.MAX_GRID_DIM_Y))
+        self.gd_z = float(cuda.Device(self.device_best).get_attribute(cuda.device_attribute.MAX_GRID_DIM_Z))
+        self.th_pr_bl = float(cuda.Device(self.device_best).get_attribute(cuda.device_attribute.MAX_THREADS_PER_BLOCK))
+        print "Max Threads per Block: "+str(self.th_pr_bl)
+
+    def best_device_select(self):
+        
+        for i in xrange(cuda.Device.count()):
+            if self.dev_compute_capability<cuda.Device(i).compute_capability()[0]:
+                self.dev_compute_capability = cuda.Device(i).compute_capability()[0]
+                self.device_best = i        
+                
+    def ros_pub_setup(self):
+        rospy.init_node('pcl_pub')
+        self.pcl_pub = rospy.Publisher('con_cld', PointCloud, queue_size=10)
+        self.flow_pub = rospy.Publisher('flow_cld', MarkerArray, queue_size=10)
+        self.src_pub = rospy.Publisher('src_loc', MarkerArray, queue_size=10)
+        self.con_pub = rospy.Publisher('con_val', numpy_msg(Floats), queue_size=10)
+        self.flow_x = rospy.Publisher('flow_x', numpy_msg(Floats), queue_size=10)
+        self.flow_y = rospy.Publisher('flow_y', numpy_msg(Floats), queue_size=10)
+        self.sim_time = rospy.Publisher('sim_time', Float64, queue_size=10)
+        
+        rospy.sleep(1.0)
+
+    def src_setup(self,itemlist):
+        self.src_loc_dis=[]
+        self.src_loc_dis = MarkerArray()
+        
+        self.no_srcs = int(len(itemlist))
+        self.src_x = np.zeros((self.no_srcs), np.float32)
+        self.src_y = np.zeros((self.no_srcs), np.float32)
+        self.src_con = np.zeros((self.no_srcs), np.float32)
+        self.src_t_high = np.zeros((self.no_srcs), np.float32)
+        self.src_std_h = np.zeros((self.no_srcs), np.float32)
+        self.src_t_low = np.zeros((self.no_srcs), np.float32)
+        self.src_std_l = np.zeros((self.no_srcs), np.float32)
+        self.src_con_cal = np.zeros((self.no_srcs), np.float32)
+        self.src_t_h = np.zeros((self.no_srcs), np.float32)
+        self.src_t_l = np.zeros((self.no_srcs), np.float32)
+        self.src_t_total = np.zeros((self.no_srcs), np.float32)
+        cnt = 0
+        for rd in itemlist:
+            self.src_x[cnt]=(float(rd.attributes['x'].value))
+            self.src_y[cnt]=(float(rd.attributes['y'].value))
+            self.src_con[cnt]=(float(rd.attributes['con'].value))
+            self.src_t_high[cnt] = (float(rd.attributes['mean_time_high'].value))
+            self.src_std_h[cnt] = (float(rd.attributes['std_time_high'].value))
+            self.src_t_low[cnt] = (float(rd.attributes['mean_time_low'].value))
+            self.src_std_l[cnt] = (float(rd.attributes['std_time_low'].value))
+            cnt+=1
+            
+        for a in range(0,self.no_srcs):
+            i1=int(round(self.src_x[a]/self.grid_x))
+            i2=int(round(self.src_y[a]/self.grid_y))
+            marker1 = []
+            marker1 = Marker()
+            marker1.header.frame_id = self.frameid
+            marker1.type = Marker.TEXT_VIEW_FACING
+            marker1.scale.z = 0.5
+            marker1.color.r = 1.0
+            marker1.color.g = 1.0
+            marker1.color.b = 1.0
+            marker1.color.a = 1.0
+            marker1.pose.position.x = self.src_x[a]+0.25
+            marker1.pose.position.y = self.src_y[a]+0.25
+            marker1.pose.position.z = 1.0 
+            marker1.text = 'SR'+str(a)
+            marker1.id = a+1000
+            self.src_loc_dis.markers.append(marker1)
+            marker1 = []
+            marker1 = Marker()
+            marker1.header.frame_id = "/"+self.frameid
+            marker1.type = Marker.SPHERE
+            marker1.scale.x = 0.2
+            marker1.scale.y = 0.2
+            marker1.scale.z = 0.2
+            marker1.color.r = 1.0
+            marker1.color.g = 0.078
+            marker1.color.b = 0.576
+            marker1.color.a = 1.0
+            marker1.pose.position.x = self.src_x[a]
+            marker1.pose.position.y = self.src_y[a]
+            marker1.pose.position.z = 1.0 
+            marker1.id = a+500
+            self.src_loc_dis.markers.append(marker1)
+            if self.src_t_high[a]>0:
+                self.src_t_h[a] = np.random.normal(self.src_t_high[a],self.src_std_h[a],1)#self.high_fixed
+            else:
+                self.src_t_h[a] = self.src_t_high[a]
+            if self.src_t_low[a]>0:
+                self.src_t_l[a] = np.random.normal(self.src_t_low[a],self.src_std_l[a],1)#self.low_fixed
+            else:
+                self.src_t_l[a] = self.src_t_low[a]
+            self.src_con_cal[a] = self.src_con[a]*(self.src_t_h[a]+self.src_t_l[a])/self.src_t_h[a]
+            self.u[(i1*self.ny)+i2] = self.src_con_cal[a]  
+            self.u_last[(i1*self.ny)+i2] = self.src_con_cal[a]                
+                
+            self.src_pub.publish(self.src_loc_dis)
+   
+    def pt_cloud_setup(self,nx,ny,gx,gy): 
+        
+        pt_cloud = PointCloud()
+        pt_cloud.header = std_msgs.msg.Header()
+        pt_cloud.header.stamp = rospy.Time.now()
+        pt_cloud.header.frame_id = self.frameid
+
+        pt_cloud.points = [None] * (nx*ny)
+
+        
+        colors = ['r', 'g', 'b']
+        for color in colors:
+            ch = Channel()            
+            ch.name = color
+            ch.values = []
+            pt_cloud.channels.append(ch)
+     
+        cnt = 0
+
+
+        for i1 in range(0,nx):
+            for i2 in range(0,ny):
+                pt_cloud.points[cnt] = Point(i1*gx, i2*gy,0)
+                pt_cloud.channels[0].values.append(0.0)
+                pt_cloud.channels[1].values.append(0.0)
+                pt_cloud.channels[2].values.append(0.0)
+                cnt = cnt+1
+
+        return pt_cloud
+          
+        
+    def time_step_2D(self):
+    
+        self.copy_to_gpu()   
+
+        self.t_step2D(self.v1x_gpu,self.v1y_gpu,self.r_gpu,self.g_gpu,self.b_gpu,self.u_last_gpu,self.u_gpu,np.int32(self.nx),np.int32(self.ny),np.float32(self.grid_x),np.float32(self.grid_y),np.float32(self.k1_x),np.float32(self.k1_y),np.float32(self.dt), self.v1_gpu, np.float32(self.max_vis_con), block=(16,16,4), grid=(self.grid_xx,self.grid_yy,self.grid_zz))
+
+        self.copy_from_gpu_updated()
+
+        for a in range(0,self.no_srcs):
+            i1=int(round(self.src_x[a]/self.grid_x))
+            i2=int(round(self.src_y[a]/self.grid_y))
+            self.src_t_total[a] = self.src_t_total[a]+self.dt
+            
+            if self.src_t_total[a]<self.src_t_h[a]:
+                self.u[(i1*self.ny)+i2] = self.src_con_cal[a]  
+                self.u_last[(i1*self.ny)+i2] = self.src_con_cal[a]
+                                
+            if self.src_t_total[a]>=self.src_t_h[a]+self.src_t_l[a]:
+                self.src_t_total[a] = 0.0
+                if self.src_t_high[a]>0:
+                    self.src_t_h[a] = np.random.normal(self.src_t_high[a],self.src_std_h[a],1)#self.high_fixed
+                else:
+                    self.src_t_h[a] = self.src_t_high[a]
+                if self.src_t_low[a]>0:
+                    self.src_t_l[a] = np.random.normal(self.src_t_low[a],self.src_std_l[a],1)#self.low_fixed
+                else:
+                    self.src_t_l[a] = self.src_t_low[a]
+                self.src_con_cal[a] = self.src_con[a]
+           
+        self.t = self.t+self.dt
+        self.ptcloud.channels[0].values[:] = self.r
+        self.ptcloud.channels[1].values[:] = self.g
+        self.ptcloud.channels[2].values[:] = self.b
+        self.pcl_pub.publish(self.ptcloud)           
+        self.con_pub.publish(self.u)
+        self.flow_x.publish(self.v1x)
+        self.flow_y.publish(self.v1y)
+        self.sim_time.publish(self.t)
+        
+    def flow_marker_array_publish(self): 
+
+        self.markerArray=[]
+        self.markerArray = MarkerArray()
+        
+        for i1 in range(0,self.nx,10):
+            for i2 in range(0,self.ny,10):
+
+                marker = Marker()
+                marker.header.frame_id = "/map"
+                marker.type = marker.ARROW
+                marker.action = marker.ADD
+                a=np.amax(self.v1x)*(abs(np.amax(self.v1x))>abs(np.amin(self.v1x)))+np.amin(self.v1x)*(abs(np.amin(self.v1x))>abs(np.amax(self.v1x)))
+                b=np.amax(self.v1y)*(abs(np.amax(self.v1y))>abs(np.amin(self.v1y)))+np.amin(self.v1y)*(abs(np.amin(self.v1y))>abs(np.amax(self.v1y)))
+                marker.scale.x = 10*self.grid_x*sqrt(self.v1x[i2+i1*self.ny]*self.v1x[i2+i1*self.ny]+self.v1y[i2+i1*self.ny]*self.v1y[i2+i1*self.ny])/sqrt(a*a+b*b)
+                marker.scale.y = 0.03
+                marker.scale.z = 0.1
+                marker.color.a = 1.0
+                marker.color.r = 1.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+                quaternion = quaternion_from_euler(0, 0, atan2(self.v1y[i2+i1*self.ny],self.v1x[i2+i1*self.ny]))
+                marker.pose.orientation.w = quaternion[3]
+                marker.pose.orientation.x = quaternion[0]
+                marker.pose.orientation.y = quaternion[1]
+                marker.pose.orientation.z = quaternion[2]
+                marker.pose.position.x = i1*self.grid_x
+                marker.pose.position.y = i2*self.grid_y
+                marker.pose.position.z = 1.0 
+                self.markerArray.markers.append(marker)
+        id = 0
+        for m in self.markerArray.markers:
+            m.id = id
+            id += 1
+
+        self.flow_pub.publish(self.markerArray)
+
+if __name__ == '__main__':
+    start_time = time.time()
+    plume1 = plume()    
+    cnt = 0
+    while plume1.t<plume1.sim_duration :# a in range (0,int(plume1.sim_duration/plume1.dt)):
+        plume1.time_step_2D()         
+        if (cnt>(plume1.flow_up_rt/plume1.dt)):
+            cnt = 0
+            plume1.flow_update()
+        cnt=cnt+1        
+    
+    print("--- %s seconds ---" % (time.time() - start_time))
